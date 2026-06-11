@@ -1,0 +1,8 @@
+build/
+build-debug/
+out/
+.vs/
+.vscode/
+CMakeUserPresets.json
+vcpkg_installed/
+*.user

@@ -1,0 +1,16 @@
+{
+  "name": "lan-share",
+  "version": "4.0.0",
+  "description": "High-performance LAN file sharing server (C++ port)",
+  "dependencies": [
+    "crow",
+    "nlohmann-json",
+    "fmt",
+    "cli11",
+    {
+      "name": "imgui",
+      "features": ["dx11-binding", "win32-binding"]
+    }
+  ],
+  "builtin-baseline": "06a7fdd564234908731c59ac46a624f808e87b1c"
+}
