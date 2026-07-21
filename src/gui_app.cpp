@@ -571,6 +571,17 @@ void render_download_tab() {
             util::human_size(static_cast<uint64_t>(speed)).c_str(),
             static_cast<unsigned long long>(snap.files),
             static_cast<unsigned long long>(snap.total_files));
+
+        // Nereye kaydediliyor — takip icin hedef klasoru goster.
+        if (!snap.dest.empty())
+            ImGui::TextColored(ImVec4(0.58f, 0.65f, 0.73f, 1.0f),
+                               "Kaydedilecek klasor: %s", snap.dest.c_str());
+
+        // Hangi dosya iniyor + tam yerel yol (nereye yaziliyor).
+        if (snap.active && !snap.current.empty())
+            ImGui::TextColored(ImVec4(0.40f, 0.74f, 0.94f, 1.0f),
+                               "Su an iniyor: %s", snap.current.c_str());
+
         if (snap.active) {
             if (ImGui::Button("Iptal", ImVec2(100, 0))) g_dl.dl.cancel();
         } else {
@@ -579,7 +590,9 @@ void render_download_tab() {
                     : ImVec4(0.13f, 0.77f, 0.37f, 1.0f),
                 "%s", snap.message.c_str());
             ImGui::SameLine();
-            if (ImGui::SmallButton("Klasoru Ac")) open_folder(g_dl.dest_buf);
+            const char* open_dir = snap.dest.empty() ? g_dl.dest_buf
+                                                      : snap.dest.c_str();
+            if (ImGui::SmallButton("Klasoru Ac")) open_folder(open_dir);
         }
     }
 }

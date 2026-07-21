@@ -121,6 +121,16 @@ struct DLState {
     }
 };
 
+// Bir yolu paylasim kokune gore '/' ayracli, okunabilir bir string'e cevirir.
+// Log ve JSON yanitlarinda "hangi dosya / nereden" bilgisini gostermek icin.
+std::string rel_to_share(const fs::path& p) {
+    std::error_code ec;
+    auto rel = fs::relative(p, g_cfg.share_dir, ec);
+    std::string s = util::path_to_utf8(ec || rel.empty() ? p : rel);
+    for (auto& c : s) if (c == '\\') c = '/';
+    return s;
+}
+
 // Dosyadan bir sonraki chunk'i oku ve binary frame olarak gonder.
 // EOF'ta {"done":true} yollar ve dosyayi kapatir. Bittiyse no-op.
 void dl_send_chunk(crow::websocket::connection& conn, DLState* s) {
@@ -144,9 +154,11 @@ void dl_send_chunk(crow::websocket::connection& conn, DLState* s) {
         auto elapsed = std::chrono::duration<double>(
             std::chrono::steady_clock::now() - s->t0).count();
         double speed = s->sent / std::max(elapsed, 0.001);
-        logf(LogLevel::Down, "{} ({}) {}/s [WS]",
-             s->name, util::human_size(s->sent),
-             util::human_size(static_cast<uint64_t>(speed)));
+        // Hangi dosya, kaynak yolu ve kimin indirdigi (IP) — takip icin.
+        logf(LogLevel::Down, "Gonderildi: {} ({}, {}/s) -> indiren {} [WS]",
+             rel_to_share(s->path), util::human_size(s->sent),
+             util::human_size(static_cast<uint64_t>(speed)),
+             conn.get_remote_ip());
         conn.send_text(R"({"done":true})");
         s->f.close();
     }
@@ -390,14 +402,18 @@ crow::response serve_file(const fs::path& path, const crow::request& req) {
             res.add_header("Content-Disposition", disp_val);
             res.add_header("Accept-Ranges",       "bytes");
             res.body = std::move(body);
-            logf(LogLevel::Down, "{} ({})", fname, util::human_size(size));
+            logf(LogLevel::Down, "Gonderildi: {} ({}) -> indiren {}",
+                 rel_to_share(path), util::human_size(size),
+                 req.remote_ip_address.empty() ? "?" : req.remote_ip_address);
             return res;
         }
         crow::response res;
         res.set_static_file_info_unsafe(util::path_to_utf8(path));
         res.add_header("Content-Disposition", disp_val);
         res.add_header("Accept-Ranges",       "bytes");
-        logf(LogLevel::Down, "{} ({})", fname, util::human_size(size));
+        logf(LogLevel::Down, "Gonderildi: {} ({}) -> indiren {}",
+             rel_to_share(path), util::human_size(size),
+             req.remote_ip_address.empty() ? "?" : req.remote_ip_address);
         return res;
     }
 
@@ -421,8 +437,10 @@ crow::response serve_file(const fs::path& path, const crow::request& req) {
     res.add_header("Content-Disposition", disp_val);
     res.body = std::move(body);
 
-    logf(LogLevel::Down, "{} (range {}-{}/{}, {})",
-         fname, range->start, range->end, size, util::human_size(content_len));
+    logf(LogLevel::Down, "Gonderildi: {} (parca {}-{}/{}, {}) -> indiren {}",
+         rel_to_share(path), range->start, range->end, size,
+         util::human_size(content_len),
+         req.remote_ip_address.empty() ? "?" : req.remote_ip_address);
     return res;
 }
 
@@ -505,20 +523,18 @@ void setup_routes(crow::SimpleApp& app) {
             std::chrono::steady_clock::now() - t0).count();
         double speed = req.body.size() / std::max(elapsed, 0.001);
 
-        fs::path show_path = dest;
-        std::error_code ec;
-        auto rel = fs::relative(dest, g_cfg.share_dir, ec);
-        if (!ec) show_path = rel;
+        // Hangi dosya, nereye kaydedildi (tam yol) ve kim gonderdi (IP) — takip icin.
+        logf(LogLevel::Up, "Alindi: {} ({}, {}/s) <- gonderen {}",
+             util::path_to_utf8(dest), util::human_size(req.body.size()),
+             util::human_size(static_cast<uint64_t>(speed)),
+             req.remote_ip_address.empty() ? "?" : req.remote_ip_address);
 
-        logf(LogLevel::Up, "{} ({}) {}/s",
-             util::path_to_utf8(show_path),
-             util::human_size(req.body.size()),
-             util::human_size(static_cast<uint64_t>(speed)));
-
+        std::string saved_rel = rel_to_share(dest);  // tarayiciya goreli yol
         nlohmann::json j{
-            {"ok",   true},
-            {"name", util::path_to_utf8(dest.filename())},
-            {"size", req.body.size()},
+            {"ok",    true},
+            {"name",  util::path_to_utf8(dest.filename())},
+            {"saved", saved_rel},
+            {"size",  req.body.size()},
         };
         crow::response r{j.dump()};
         r.add_header("Content-Type", "application/json");
@@ -664,9 +680,13 @@ void setup_routes(crow::SimpleApp& app) {
                 }
                 if (sz == 0) {
                     s->f.close();
+                    std::string saved_rel = rel_to_share(s->dest);
+                    logf(LogLevel::Up, "Alindi: {} (0 B) <- gonderen {} [WS]",
+                         saved_rel, conn.get_remote_ip());
                     nlohmann::json ack{
                         {"ok", true},
                         {"name", util::path_to_utf8(s->dest.filename())},
+                        {"saved", saved_rel},
                         {"written", uint64_t{0}}
                     };
                     conn.send_text(ack.dump());
@@ -694,19 +714,17 @@ void setup_routes(crow::SimpleApp& app) {
                     std::chrono::steady_clock::now() - s->t0).count();
                 double speed = s->written / std::max(elapsed, 0.001);
 
-                fs::path show = s->dest;
-                std::error_code ec;
-                auto rel_p = fs::relative(s->dest, g_cfg.share_dir, ec);
-                if (!ec) show = rel_p;
+                // Hangi dosya, nereye kaydedildi (tam yol) ve kim gonderdi (IP).
+                logf(LogLevel::Up, "Alindi: {} ({}, {}/s) <- gonderen {} [WS]",
+                     util::path_to_utf8(s->dest), util::human_size(s->written),
+                     util::human_size(static_cast<uint64_t>(speed)),
+                     conn.get_remote_ip());
 
-                logf(LogLevel::Up, "{} ({}) {}/s [WS]",
-                     util::path_to_utf8(show),
-                     util::human_size(s->written),
-                     util::human_size(static_cast<uint64_t>(speed)));
-
+                std::string saved_rel = rel_to_share(s->dest);  // tarayiciya goreli yol
                 nlohmann::json ack{
                     {"ok", true},
                     {"name", util::path_to_utf8(s->dest.filename())},
+                    {"saved", saved_rel},
                     {"written", s->written}
                 };
                 conn.send_text(ack.dump());
@@ -772,6 +790,10 @@ void setup_routes(crow::SimpleApp& app) {
                            * 1024 * 1024;
                 s->sent  = 0;
                 s->t0    = std::chrono::steady_clock::now();
+
+                logf(LogLevel::Info, "Istek: {} ({}) -> indiren {} [WS]",
+                     rel_to_share(s->path), util::human_size(s->size),
+                     conn.get_remote_ip());
 
                 nlohmann::json meta{
                     {"ok",   true},

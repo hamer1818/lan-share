@@ -17,6 +17,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -166,11 +167,14 @@ void download_on(wsc::WebSocketClient& ws, const Task& task,
 
 // Worker havuzu ile tum gorevleri indirir; hatalarin listesini dondurur.
 // Her worker bir WS baglantisini gorevler arasinda yeniden kullanir.
+// on_start: bir dosya indirilmeye baslarken yerel hedef yoluyla cagrilir
+// (GUI/CLI'de "su an inen dosya" gostergesi icin). Cok thread'li — thread-safe olmali.
 std::vector<std::string> do_download(const Target& t, const std::vector<Task>& tasks,
                                      int parallel,
                                      std::atomic<uint64_t>& bytes,
                                      std::atomic<uint64_t>& files,
-                                     std::atomic<bool>& cancel)
+                                     std::atomic<bool>& cancel,
+                                     const std::function<void(const std::string&)>& on_start = {})
 {
     std::mutex               err_mtx;
     std::vector<std::string> errors;
@@ -188,6 +192,7 @@ std::vector<std::string> do_download(const Target& t, const std::vector<Task>& t
                     ws = std::make_unique<wsc::WebSocketClient>();
                     ws->connect(t.host, t.port, "/ws/download");
                 }
+                if (on_start) on_start(util::path_to_utf8(task.local));
                 download_on(*ws, task, bytes, cancel);
                 files.fetch_add(1);
             } catch (const std::exception& e) {
@@ -322,6 +327,8 @@ bool Downloader::start(const std::string& server, const std::string& remote,
     bytes_ = 0; files_ = 0; total_bytes_ = 0; total_files_ = 0;
     final_secs_ = 0.0;
     message_.clear();
+    cur_.clear();
+    dest_.clear();
     t0_ = std::chrono::steady_clock::now();
     active_ = true;
     th_ = std::thread(&Downloader::run, this, server, remote, outdir,
@@ -341,7 +348,12 @@ Downloader::Snapshot Downloader::snapshot() {
     s.seconds = s.active
         ? std::chrono::duration<double>(std::chrono::steady_clock::now() - t0_).count()
         : final_secs_.load();
-    { std::lock_guard lk(mtx_); s.message = message_; }
+    {
+        std::lock_guard lk(mtx_);
+        s.message = message_;
+        s.current = cur_;
+        s.dest    = dest_;
+    }
     return s;
 }
 
@@ -369,10 +381,22 @@ void Downloader::run(std::string server, std::string remote, std::string outdir,
     total_bytes_ = total;
     total_files_ = tasks.size();
 
+    {
+        std::lock_guard lk(mtx_);
+        dest_ = util::path_to_utf8(is_folder ? outbase : util::utf8_to_path(outdir));
+        cur_.clear();
+    }
+
     std::error_code ec;
     fs::create_directories(is_folder ? outbase : util::utf8_to_path(outdir), ec);
 
-    auto errors = do_download(t, tasks, parallel, bytes_, files_, cancel_);
+    auto errors = do_download(t, tasks, parallel, bytes_, files_, cancel_,
+        [this](const std::string& p) {
+            std::lock_guard lk(mtx_);
+            cur_ = p;
+        });
+
+    { std::lock_guard lk(mtx_); cur_.clear(); }
 
     double secs = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - t0_).count();
@@ -403,7 +427,8 @@ namespace {
 void monitor_loop(std::atomic<uint64_t>& bytes, std::atomic<uint64_t>& files,
                   uint64_t total_bytes, size_t total_files,
                   std::chrono::steady_clock::time_point t0,
-                  std::atomic<bool>& running) {
+                  std::atomic<bool>& running,
+                  std::mutex& cur_mtx, std::string& cur) {
     using namespace std::chrono;
     while (running.load()) {
         std::this_thread::sleep_for(milliseconds(300));
@@ -411,19 +436,29 @@ void monitor_loop(std::atomic<uint64_t>& bytes, std::atomic<uint64_t>& files,
         uint64_t fdone = files.load();
         double el = duration<double>(steady_clock::now() - t0).count();
         double sp = b / std::max(el, 0.001);
+
+        // Su an inen dosyanin adi (yol degil) — takip icin.
+        std::string curfile;
+        { std::lock_guard lk(cur_mtx); curfile = cur; }
+        auto slash = curfile.find_last_of("/\\");
+        if (slash != std::string::npos) curfile = curfile.substr(slash + 1);
+        if (curfile.size() > 32) curfile = curfile.substr(0, 29) + "...";
+
         std::string line;
         if (total_bytes > 0) {
             double pct = std::min(100.0, 100.0 * b / total_bytes);
             double rem = sp > 0 ? (total_bytes - b) / sp : 0;
-            line = fmt::format("  {:>3.0f}%  {} / {}  |  {}/s  |  {}/{} dosya  |  kalan {:.0f}s   ",
+            line = fmt::format("  {:>3.0f}%  {} / {}  |  {}/s  |  {}/{} dosya  |  kalan {:.0f}s",
                 pct, util::human_size(b), util::human_size(total_bytes),
                 util::human_size(static_cast<uint64_t>(sp)),
                 fdone, total_files, rem);
         } else {
-            line = fmt::format("  {}  |  {}/s  |  {}/{} dosya   ",
+            line = fmt::format("  {}  |  {}/s  |  {}/{} dosya",
                 util::human_size(b), util::human_size(static_cast<uint64_t>(sp)),
                 fdone, total_files);
         }
+        if (!curfile.empty()) line += "  |  " + curfile;
+        if (line.size() < 118) line += std::string(118 - line.size(), ' ');
         fmt::print("\r{}", line);
         std::fflush(stdout);
     }
@@ -468,11 +503,18 @@ int run_get(const std::string& server, const std::string& remote,
     std::atomic<uint64_t> bytes{0}, files{0};
     std::atomic<bool>     cancel{false};
     std::atomic<bool>     running{true};
+    std::mutex            cur_mtx;
+    std::string           cur_file;
     auto t0 = std::chrono::steady_clock::now();
 
     std::thread mon(monitor_loop, std::ref(bytes), std::ref(files),
-                    total_bytes, tasks.size(), t0, std::ref(running));
-    auto errors = do_download(t, tasks, parallel, bytes, files, cancel);
+                    total_bytes, tasks.size(), t0, std::ref(running),
+                    std::ref(cur_mtx), std::ref(cur_file));
+    auto errors = do_download(t, tasks, parallel, bytes, files, cancel,
+        [&](const std::string& p) {
+            std::lock_guard lk(cur_mtx);
+            cur_file = p;
+        });
     running = false;
     mon.join();
 
@@ -481,7 +523,7 @@ int run_get(const std::string& server, const std::string& remote,
     uint64_t b = bytes.load();
     double sp = b / std::max(el, 0.001);
 
-    fmt::print("\r{:80}\r", "");  // ilerleme satirini temizle
+    fmt::print("\r{:120}\r", "");  // ilerleme satirini temizle
     print(fg(color::lime_green) | emphasis::bold, "  Tamamlandi: ");
     print("{} dosya, {}, {:.1f}s, ort {}/s\n",
           files.load(), util::human_size(b), el,

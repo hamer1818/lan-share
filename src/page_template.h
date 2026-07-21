@@ -110,6 +110,10 @@ inline constexpr std::string_view PAGE_TEMPLATE = R"HTML(<!DOCTYPE html>
     white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;
     margin-bottom:3px; }}
   .q-info {{ font-size:.72rem; color:var(--text2); font-family:'Cascadia Code',monospace; }}
+  .q-dest {{ font-size:.7rem; color:var(--text2); font-family:'Cascadia Code',monospace;
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:100%;
+    margin:2px 0 6px; }}
+  .q-dest b {{ color:var(--accent2); font-weight:600; }}
   .q-bar {{ height:4px; background:rgba(99,102,241,0.15); border-radius:2px; overflow:hidden; }}
   .q-fill {{ height:100%; border-radius:2px; width:0%; transition:width .1s linear; }}
   .q-fill.uploading {{ background:linear-gradient(90deg,#6366f1,#a78bfa); }}
@@ -306,18 +310,41 @@ function scheduleProgressUpdate(eng) {{
   ovCounts.textContent = cntStr;
 }}
 
+// Yuklenen dosyanin sunucuda kaydedilecegi tam yolu (gorunum icin) uretir.
+// UP_URL: bu tarayici klasoru ("/" veya "/altklasor"); relPath: dosyanin
+// klasor icindeki goreli yolu.
+function serverDestPath(relPath) {{
+  let base = (UP_URL && UP_URL !== '/') ? UP_URL : '';
+  let full = (base + '/' + relPath).replace(/\/{{2,}}/g, '/');
+  if (!full.startsWith('/')) full = '/' + full;
+  return full;
+}}
+
+// Dosya adlari textContent ile yazilir (innerHTML degil) — XSS yok.
+// Her satir: dosya adi + sunucudaki hedef yol + ilerleme cubugu.
 function createActiveEl(eng, id, item) {{
   const el = document.createElement('div');
   el.className = 'q-item';
-  const showPath = item.relPath.includes('/');
-  el.innerHTML = `
-    ${{showPath ? `<div class="q-path">&#128193; ${{item.relPath}}</div>` : ''}}
-    <div class="q-top">
-      <span class="q-name">${{item.file.name}}</span>
-      <span class="q-info">Basliyor...</span>
-    </div>
-    <div class="q-bar"><div class="q-fill uploading"></div></div>`;
+
+  const top = document.createElement('div'); top.className = 'q-top';
+  const nm = document.createElement('span'); nm.className = 'q-name';
+  nm.textContent = item.file.name;
+  const info = document.createElement('span'); info.className = 'q-info';
+  info.textContent = 'Basliyor...';
+  top.appendChild(nm); top.appendChild(info);
+
+  const dest = document.createElement('div'); dest.className = 'q-dest';
+  const dlab = document.createElement('b'); dlab.textContent = 'Sunucuya: ';
+  const dpath = document.createElement('span'); dpath.textContent = serverDestPath(item.relPath);
+  dest.appendChild(dlab); dest.appendChild(dpath);
+
+  const wrap = document.createElement('div'); wrap.className = 'q-bar';
+  const bar = document.createElement('div'); bar.className = 'q-fill uploading';
+  wrap.appendChild(bar);
+
+  el.appendChild(top); el.appendChild(dest); el.appendChild(wrap);
   queue.appendChild(el);
+  el._dpath = dpath;  // sunucudan gelen gercek kayit yolunu yazmak icin
   return el;
 }}
 
@@ -359,6 +386,7 @@ async function wsUploadOne(eng, ws, item) {{
 
   return new Promise((resolve, reject) => {{
     ws.send(JSON.stringify({{ path: item.relPath, size: item.file.size }}));
+    if (item.file.size > 0) info.textContent = 'Gonderiliyor…';
     let offset = 0;
     function sendNext() {{
       if (offset >= item.file.size) return;
@@ -376,8 +404,9 @@ async function wsUploadOne(eng, ws, item) {{
         state.loaded = res.written;
         bar.style.width = '100%';
         bar.className = 'q-fill done';
-        info.textContent = 'WS Bitti';
-        setTimeout(() => el.remove(), 1000);
+        info.textContent = 'Yuklendi';
+        if (res.saved && el._dpath) el._dpath.textContent = '/' + res.saved;
+        setTimeout(() => el.remove(), 1200);
         resolve();
       }} else reject(new Error(res.error));
     }};
@@ -394,6 +423,7 @@ async function httpUploadOne(eng, item) {{
 
   try {{
     const xhr = new XMLHttpRequest();
+    let savedPath = null;
     await new Promise((resolve, reject) => {{
       xhr.upload.onprogress = (e) => {{
         if (e.lengthComputable) {{
@@ -404,7 +434,12 @@ async function httpUploadOne(eng, item) {{
           scheduleProgressUpdate(eng);
         }}
       }};
-      xhr.onload = () => {{ if (xhr.status === 200) resolve(); else reject(new Error(`HTTP ${{xhr.status}}`)); }};
+      xhr.onload = () => {{
+        if (xhr.status === 200) {{
+          try {{ savedPath = JSON.parse(xhr.responseText).saved; }} catch (_) {{}}
+          resolve();
+        }} else reject(new Error(`HTTP ${{xhr.status}}`));
+      }};
       xhr.onerror = () => reject(new Error('Ag hatasi'));
       const q = `?dir=${{encodeURIComponent(UP_URL)}}&path=${{encodeURIComponent(item.relPath)}}`;
       xhr.open('POST', '/api/upload' + q, true);
@@ -414,8 +449,9 @@ async function httpUploadOne(eng, item) {{
     eng.uploadedFiles++;
     bar.style.width = '100%';
     bar.className = 'q-fill done';
-    info.textContent = 'HTTP Bitti';
-    setTimeout(() => el.remove(), 1000);
+    info.textContent = 'Yuklendi';
+    if (savedPath && el._dpath) el._dpath.textContent = '/' + savedPath;
+    setTimeout(() => el.remove(), 1200);
   }} catch (e) {{
     eng.errorFiles++;
     bar.style.width = '100%';
@@ -554,18 +590,27 @@ function wsStream(serverPath, onChunk) {{
 }}
 
 // ── Ilerleme satiri (dosya adlari textContent ile — XSS yok) ──
-function dlRow(labelText) {{
+function dlRow(labelText, destText) {{
   dashboard.classList.add('active');
   const el = document.createElement('div'); el.className = 'q-item';
   const top = document.createElement('div'); top.className = 'q-top';
   const nm = document.createElement('span'); nm.className = 'q-name'; nm.textContent = labelText;
   const info = document.createElement('span'); info.className = 'q-info'; info.textContent = 'Baglaniyor...';
   top.appendChild(nm); top.appendChild(info);
+  el.appendChild(top);
+  let dpath = null;
+  if (destText) {{
+    const dest = document.createElement('div'); dest.className = 'q-dest';
+    const dlab = document.createElement('b'); dlab.textContent = 'Kaydediliyor: ';
+    dpath = document.createElement('span'); dpath.textContent = destText;
+    dest.appendChild(dlab); dest.appendChild(dpath);
+    el.appendChild(dest);
+  }}
   const wrap = document.createElement('div'); wrap.className = 'q-bar';
   const bar = document.createElement('div'); bar.className = 'q-fill downloading'; wrap.appendChild(bar);
-  el.appendChild(top); el.appendChild(wrap);
+  el.appendChild(wrap);
   queue.appendChild(el);
-  return {{ el, nm, bar, info, t0: Date.now() }};
+  return {{ el, nm, bar, info, dpath, t0: Date.now() }};
 }}
 function dlRowDone(row, text) {{
   row.bar.style.width = '100%'; row.bar.className = 'q-fill done';
@@ -587,11 +632,12 @@ function joinPath(a, b) {{ return a.replace(/\/+$/, '') + '/' + b; }}
 // ── Tek dosya indirme ──
 async function wsDownloadFile(btn) {{
   const relPath = btn.dataset.path, name = btn.dataset.name;
-  let writable = null, parts = null;
+  let writable = null, parts = null, savedName = name;
   if (window.showSaveFilePicker) {{
     try {{
       const h = await window.showSaveFilePicker({{ suggestedName: name }});
       writable = await h.createWritable();
+      savedName = h.name || name;
     }} catch (e) {{
       if (e && e.name === 'AbortError') return;
       writable = null;  // guvensiz baglam / reddedildi → Blob'a dus
@@ -599,7 +645,9 @@ async function wsDownloadFile(btn) {{
   }}
   if (!writable) parts = [];
 
-  const row = dlRow('⬇️ ' + name);
+  const destText = writable ? (savedName + '  (sectiginiz konum)')
+                            : ('Indirilenler klasoru / ' + name);
+  const row = dlRow('⬇️ ' + name, destText);
   try {{
     await wsStream(relPath, async (u8, received, size) => {{
       if (writable) await writable.write(u8); else parts.push(u8);
@@ -641,7 +689,9 @@ async function wsDownloadFolder(btn) {{
     return;
   }}
 
-  const row = dlRow('📁 ' + name + '  (0/' + data.count + ')');
+  const destText = dirHandle ? (dirHandle.name + ' / ' + name + ' /…')
+                             : ('Indirilenler klasoru / ' + name + '.zip');
+  const row = dlRow('📁 ' + name + '  (0/' + data.count + ')', destText);
   const totalSize = data.total || 0;
   let filesDone = 0, grandRecv = 0;
   const progress = (extra) => {{

@@ -50,6 +50,8 @@ public:
         uint64_t    files = 0, total_files = 0;
         double      seconds = 0.0;
         std::string message;
+        std::string current;  // su an inen dosyanin yerel tam yolu
+        std::string dest;     // dosyalarin kaydedildigi kok klasor
     };
 
     ~Downloader();
@@ -66,8 +68,10 @@ private:
              int parallel, uint64_t total_hint);
 
     std::thread th_;
-    std::mutex  mtx_;   // message_ korumasi
+    std::mutex  mtx_;   // message_, cur_, dest_ korumasi
     std::string message_;
+    std::string cur_;    // su an inen dosyanin yerel yolu
+    std::string dest_;   // hedef kok klasor (goruntuleme)
     std::atomic<bool>     active_{false};
     std::atomic<bool>     finished_{false};
     std::atomic<bool>     failed_{false};
