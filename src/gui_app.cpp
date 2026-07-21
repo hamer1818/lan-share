@@ -3,6 +3,8 @@
 #include <windows.h>
 #include <shobjidl.h>      // IFileDialog
 #include <shlobj.h>
+#include <knownfolders.h>  // FOLDERID_Downloads
+#include <shellapi.h>      // ShellExecuteW
 #include <d3d11.h>
 #include <dxgi.h>
 #include <tchar.h>
@@ -18,9 +20,11 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include "gui_app.hpp"
 #include "server.hpp"
+#include "client.hpp"
 #include "util.hpp"
 
 namespace fs = std::filesystem;
@@ -170,7 +174,7 @@ void set_status(const std::string& msg, ImVec4 color) {
     g_status_color = color;
 }
 
-bool browse_folder(std::string& out) {
+bool browse_folder(std::string& out, const wchar_t* title = L"Paylasilacak klasoru sec") {
     IFileDialog* pDialog = nullptr;
     HRESULT hr = CoCreateInstance(
         CLSID_FileOpenDialog, nullptr, CLSCTX_ALL,
@@ -180,7 +184,7 @@ bool browse_folder(std::string& out) {
     DWORD options = 0;
     pDialog->GetOptions(&options);
     pDialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM);
-    pDialog->SetTitle(L"Paylasilacak klasoru sec");
+    pDialog->SetTitle(title);
 
     hr = pDialog->Show(nullptr);
     if (FAILED(hr)) { pDialog->Release(); return false; }
@@ -203,6 +207,66 @@ bool browse_folder(std::string& out) {
     pItem->Release();
     pDialog->Release();
     return !out.empty();
+}
+
+// ── Indirme sekmesi durumu ──────────────────────────
+struct DownloadUi {
+    std::mutex mtx;   // devices/entries/cur_dir/error/selected korumasi
+    std::vector<client::Device>      devices;
+    std::vector<client::RemoteEntry> entries;
+    std::string cur_dir;              // "" = uzak kok
+    std::string error;
+    bool connected = false;
+    int  selected  = -1;
+    std::atomic<bool> scanning{false};
+    std::atomic<bool> browsing{false};
+    char host_buf[160]  = {};
+    char dest_buf[1024] = {};
+    client::Downloader dl;
+};
+DownloadUi g_dl;
+
+void start_scan() {
+    if (g_dl.scanning.exchange(true)) return;
+    std::thread([] {
+        auto found = client::discover(900);
+        {
+            std::lock_guard lk(g_dl.mtx);
+            g_dl.devices = std::move(found);
+        }
+        g_dl.scanning = false;
+    }).detach();
+}
+
+void start_browse(std::string dir) {
+    if (g_dl.browsing.exchange(true)) return;
+    std::string server(g_dl.host_buf);
+    std::thread([server = std::move(server), dir = std::move(dir)] {
+        std::vector<client::RemoteEntry> ents;
+        std::string err;
+        bool ok = client::browse(server, dir, ents, err);
+        {
+            std::lock_guard lk(g_dl.mtx);
+            if (ok) {
+                g_dl.connected = true;
+                g_dl.cur_dir   = dir;
+                g_dl.entries   = std::move(ents);
+                g_dl.error.clear();
+            } else {
+                g_dl.error = err;
+            }
+            g_dl.selected = -1;
+        }
+        g_dl.browsing = false;
+    }).detach();
+}
+
+void open_folder(const char* utf8_path) {
+    int n = MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, nullptr, 0);
+    if (n <= 0) return;
+    std::wstring w(static_cast<size_t>(n - 1), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, utf8_path, -1, w.data(), n);
+    ::ShellExecuteW(nullptr, L"open", w.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
 }
 
 void start_server_btn() {
@@ -235,6 +299,9 @@ void start_server_btn() {
             g_port, ip, g_port);
         server::logf(server::LogLevel::Info,
             "Paylasilan: {}", util::path_to_utf8(share));
+        server::logf(server::LogLevel::Info,
+            "Karsi tarafta uygulama yoksa tarayicidan kurabilir: "
+            "http://{}:{}/lan_share.exe", ip, g_port);
     } else {
         set_status("Server zaten calisiyor.", ImVec4(0.96f, 0.62f, 0.04f, 1.0f));
     }
@@ -275,6 +342,10 @@ void apply_dark_theme() {
     c[ImGuiCol_ScrollbarBg]         = rgba(15, 23, 42, 0.0f);
     c[ImGuiCol_ScrollbarGrab]       = rgba(99, 102, 241, 0.5f);
     c[ImGuiCol_ScrollbarGrabHovered]= rgba(99, 102, 241, 0.8f);
+    c[ImGuiCol_Tab]                 = rgba(30, 41, 59);
+    c[ImGuiCol_TabHovered]          = rgba(99, 102, 241, 0.8f);
+    c[ImGuiCol_TabSelected]         = rgba(99, 102, 241, 0.6f);
+    c[ImGuiCol_PlotHistogram]       = rgba(99, 102, 241);
 
     s.WindowRounding   = 8.0f;
     s.FrameRounding    = 6.0f;
@@ -286,25 +357,8 @@ void apply_dark_theme() {
     s.ScrollbarRounding= 5.0f;
 }
 
-void render_main_window() {
-    ImGuiViewport* vp = ImGui::GetMainViewport();
-    ImGui::SetNextWindowPos(vp->WorkPos);
-    ImGui::SetNextWindowSize(vp->WorkSize);
-
-    ImGui::Begin("lan_share", nullptr,
-        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-        ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoCollapse |
-        ImGuiWindowFlags_NoBringToFrontOnFocus);
-
-    // Baslik
-    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.94f, 0.98f, 1.0f));
-    ImGui::SetWindowFontScale(1.5f);
-    ImGui::Text("LAN Dosya Paylasimi");
-    ImGui::SetWindowFontScale(1.0f);
-    ImGui::PopStyleColor();
-    ImGui::TextDisabled("v4.0 — C++ Port (Crow + Dear ImGui)");
-    ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
-
+// ── "Paylas" sekmesi: sunucu kontrolu + log ────────
+void render_server_tab() {
     bool running = server::is_running();
 
     // Klasor
@@ -376,6 +430,192 @@ void render_main_window() {
         }
     }
     ImGui::EndChild();
+}
+
+// ── "Indir" sekmesi: kesif + uzak gezgin + indirme ──
+void render_download_tab() {
+    std::lock_guard lk(g_dl.mtx);
+
+    const bool busy_net = g_dl.browsing.load();
+    auto snap = g_dl.dl.snapshot();
+
+    // 1) Cihaz kesfi
+    ImGui::TextUnformatted("Agdaki cihazlar:");
+    ImGui::SameLine();
+    ImGui::BeginDisabled(g_dl.scanning.load());
+    if (ImGui::SmallButton(g_dl.scanning.load() ? "Taraniyor..." : "Tara"))
+        start_scan();
+    ImGui::EndDisabled();
+
+    if (g_dl.devices.empty()) {
+        ImGui::TextDisabled("Cihaz bulunamadi — Tara'ya bas veya adresi elle gir.");
+    } else {
+        for (int i = 0; i < static_cast<int>(g_dl.devices.size()); ++i) {
+            const auto& d = g_dl.devices[i];
+            ImGui::PushID(i);
+            std::string lbl = fmt::format("{}  ({}:{})", d.name, d.host, d.port);
+            if (ImGui::Button(lbl.c_str())) {
+                std::snprintf(g_dl.host_buf, sizeof(g_dl.host_buf), "%s:%u",
+                              d.host.c_str(), static_cast<unsigned>(d.port));
+                start_browse("");
+            }
+            if (ImGui::IsItemHovered() && !d.share.empty())
+                ImGui::SetTooltip("Paylasilan: %s", d.share.c_str());
+            ImGui::PopID();
+            ImGui::SameLine();
+        }
+        ImGui::NewLine();
+    }
+
+    // 2) Manuel adres
+    ImGui::Spacing();
+    ImGui::TextUnformatted("Sunucu adresi");
+    ImGui::PushItemWidth(240);
+    ImGui::InputTextWithHint("##host", "192.168.1.5:8000",
+                             g_dl.host_buf, sizeof(g_dl.host_buf));
+    ImGui::PopItemWidth();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(busy_net || g_dl.host_buf[0] == '\0');
+    if (ImGui::Button(busy_net ? "Baglaniyor..." : "Baglan", ImVec2(120, 0)))
+        start_browse("");
+    ImGui::EndDisabled();
+
+    if (!g_dl.error.empty())
+        ImGui::TextColored(ImVec4(0.94f, 0.27f, 0.27f, 1.0f),
+                           "Hata: %s", g_dl.error.c_str());
+
+    // 3) Uzak gezgin
+    if (g_dl.connected) {
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        ImGui::Text("Konum: /%s", g_dl.cur_dir.c_str());
+        ImGui::SameLine();
+        ImGui::BeginDisabled(busy_net);
+        if (!g_dl.cur_dir.empty()) {
+            if (ImGui::SmallButton("Ust klasor")) {
+                auto pos = g_dl.cur_dir.find_last_of('/');
+                start_browse(pos == std::string::npos
+                                 ? "" : g_dl.cur_dir.substr(0, pos));
+            }
+            ImGui::SameLine();
+        }
+        if (ImGui::SmallButton("Yenile")) start_browse(g_dl.cur_dir);
+        ImGui::EndDisabled();
+
+        ImGui::BeginChild("remote_list", ImVec2(0, 200), true);
+        if (g_dl.entries.empty()) ImGui::TextDisabled("(bos klasor)");
+        for (int i = 0; i < static_cast<int>(g_dl.entries.size()); ++i) {
+            const auto& e = g_dl.entries[i];
+            ImGui::PushID(i);
+            std::string lbl = e.is_dir
+                ? fmt::format("[Klasor]  {}", e.name)
+                : fmt::format("{}   ({})", e.name, util::human_size(e.size));
+            if (ImGui::Selectable(lbl.c_str(), g_dl.selected == i,
+                                  ImGuiSelectableFlags_AllowDoubleClick)) {
+                g_dl.selected = i;
+                if (e.is_dir &&
+                    ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                    start_browse(g_dl.cur_dir.empty()
+                                     ? e.name : g_dl.cur_dir + "/" + e.name);
+                }
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndChild();
+        ImGui::TextDisabled("Klasore girmek icin cift tikla.");
+
+        // 4) Hedef klasor + indirme butonlari
+        ImGui::Spacing();
+        ImGui::TextUnformatted("Kaydedilecek klasor");
+        ImGui::PushItemWidth(-110);
+        ImGui::InputText("##dest", g_dl.dest_buf, sizeof(g_dl.dest_buf));
+        ImGui::PopItemWidth();
+        ImGui::SameLine();
+        if (ImGui::Button("Sec...", ImVec2(100, 0))) {
+            std::string picked;
+            if (browse_folder(picked, L"Kaydedilecek klasoru sec"))
+                std::snprintf(g_dl.dest_buf, sizeof(g_dl.dest_buf), "%s",
+                              picked.c_str());
+        }
+
+        const bool can_start = !snap.active && g_dl.dest_buf[0] != '\0';
+        const bool sel_ok = g_dl.selected >= 0 &&
+                            g_dl.selected < static_cast<int>(g_dl.entries.size());
+        ImGui::BeginDisabled(!can_start || !sel_ok);
+        if (ImGui::Button("Secileni Indir", ImVec2(160, 34)) && sel_ok) {
+            const auto& e = g_dl.entries[g_dl.selected];
+            std::string remote = g_dl.cur_dir.empty()
+                                     ? e.name : g_dl.cur_dir + "/" + e.name;
+            g_dl.dl.start(g_dl.host_buf, remote, g_dl.dest_buf, 4,
+                          e.is_dir ? 0 : e.size);
+        }
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!can_start);
+        if (ImGui::Button("Bu Klasoru Komple Indir", ImVec2(220, 34)))
+            g_dl.dl.start(g_dl.host_buf, g_dl.cur_dir, g_dl.dest_buf, 4);
+        ImGui::EndDisabled();
+    }
+
+    // 5) Ilerleme paneli
+    if (snap.active || snap.finished) {
+        ImGui::Spacing(); ImGui::Separator(); ImGui::Spacing();
+        float frac = snap.total_bytes
+            ? static_cast<float>(static_cast<double>(snap.bytes) /
+                                 static_cast<double>(snap.total_bytes))
+            : (snap.finished ? 1.0f : 0.0f);
+        ImGui::ProgressBar(frac, ImVec2(-1, 22));
+        double speed = snap.seconds > 0 ? snap.bytes / snap.seconds : 0;
+        ImGui::Text("%s / %s  |  %s/s  |  %llu / %llu dosya",
+            util::human_size(snap.bytes).c_str(),
+            util::human_size(snap.total_bytes).c_str(),
+            util::human_size(static_cast<uint64_t>(speed)).c_str(),
+            static_cast<unsigned long long>(snap.files),
+            static_cast<unsigned long long>(snap.total_files));
+        if (snap.active) {
+            if (ImGui::Button("Iptal", ImVec2(100, 0))) g_dl.dl.cancel();
+        } else {
+            ImGui::TextColored(snap.failed
+                    ? ImVec4(0.94f, 0.27f, 0.27f, 1.0f)
+                    : ImVec4(0.13f, 0.77f, 0.37f, 1.0f),
+                "%s", snap.message.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Klasoru Ac")) open_folder(g_dl.dest_buf);
+        }
+    }
+}
+
+void render_main_window() {
+    ImGuiViewport* vp = ImGui::GetMainViewport();
+    ImGui::SetNextWindowPos(vp->WorkPos);
+    ImGui::SetNextWindowSize(vp->WorkSize);
+
+    ImGui::Begin("lan_share", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoBringToFrontOnFocus);
+
+    // Baslik
+    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.94f, 0.94f, 0.98f, 1.0f));
+    ImGui::SetWindowFontScale(1.5f);
+    ImGui::Text("LAN Dosya Paylasimi");
+    ImGui::SetWindowFontScale(1.0f);
+    ImGui::PopStyleColor();
+    ImGui::TextDisabled("v4.0 — C++ Port (Crow + Dear ImGui)");
+    ImGui::Spacing();
+
+    if (ImGui::BeginTabBar("main_tabs")) {
+        if (ImGui::BeginTabItem("Paylas (Gonder)")) {
+            ImGui::Spacing();
+            render_server_tab();
+            ImGui::EndTabItem();
+        }
+        if (ImGui::BeginTabItem("Al (Indir)")) {
+            ImGui::Spacing();
+            render_download_tab();
+            ImGui::EndTabItem();
+        }
+        ImGui::EndTabBar();
+    }
 
     ImGui::End();
 }
@@ -423,6 +663,24 @@ int run() {
     }
 
     ::CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    // Varsayilan indirme hedefi = kullanicinin Downloads klasoru
+    {
+        PWSTR pw = nullptr;
+        if (SUCCEEDED(::SHGetKnownFolderPath(FOLDERID_Downloads, 0, nullptr, &pw))
+            && pw) {
+            int n = WideCharToMultiByte(CP_UTF8, 0, pw, -1,
+                                        nullptr, 0, nullptr, nullptr);
+            if (n > 1) {
+                std::string u8(static_cast<size_t>(n - 1), '\0');
+                WideCharToMultiByte(CP_UTF8, 0, pw, -1,
+                                    u8.data(), n, nullptr, nullptr);
+                std::snprintf(g_dl.dest_buf, sizeof(g_dl.dest_buf), "%s",
+                              u8.c_str());
+            }
+            ::CoTaskMemFree(pw);
+        }
+    }
 
     WNDCLASSEXW wc{};
     wc.cbSize        = sizeof(wc);

@@ -13,6 +13,7 @@
 
 #include "server.hpp"
 #include "gui_app.hpp"
+#include "client.hpp"
 #include "util.hpp"
 
 namespace fs = std::filesystem;
@@ -36,6 +37,8 @@ void cli_banner(const server::Config& cfg, const std::string& ip) {
     print(dim, "  Klasor : "); print(white, "{}\n", util::path_to_utf8(cfg.share_dir));
     print(dim, "  Yerel  : "); print(green, "http://localhost:{}\n", cfg.port);
     print(dim, "  Ag     : "); print(green | emphasis::bold, "http://{}:{}\n", ip, cfg.port);
+    print(dim, "  Kurulum: "); print(white, "http://{}:{}/lan_share.exe", ip, cfg.port);
+    print(dim, "  (karsi taraf icin)\n");
     print(dim, "  Buffer : "); print(white, "{} MB  ", cfg.buffer_mb);
     print(dim, "|  Paralel : "); print(white, "{} dosya\n", cfg.parallel);
     print(purple, "  {}\n", line);
@@ -56,6 +59,28 @@ int main(int argc, char** argv) {
     // Argumansiz → GUI mode
     if (argc <= 1) {
         int rc = gui::run();
+        WSACleanup();
+        return rc;
+    }
+
+    // "get" alt komutu → indirme istemcisi modu
+    //   lan_share.exe get <host[:port]> <uzak-yol> [-o <klasor>] [-j <paralel>]
+    if (std::string(argv[1]) == "get") {
+        CLI::App capp{"lan_share indirme istemcisi"};
+        std::string server, remote, outdir = ".";
+        int parallel = 4;
+        capp.add_option("server",       server,   "Sunucu host[:port]")->required();
+        capp.add_option("remote",       remote,   "Uzak dosya/klasor yolu")->required();
+        capp.add_option("-o,--out",     outdir,   "Hedef klasor (default .)");
+        capp.add_option("-j,--parallel", parallel, "Es zamanli baglanti (default 4)");
+        try {
+            capp.parse(argc - 1, argv + 1);  // argv[1]="get" program adi sayilir
+        } catch (const CLI::ParseError& e) {
+            int rc = capp.exit(e);
+            WSACleanup();
+            return rc;
+        }
+        int rc = client::run_get(server, remote, outdir, parallel);
         WSACleanup();
         return rc;
     }

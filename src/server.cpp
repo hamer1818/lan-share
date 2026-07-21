@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstring>
 #include <fstream>
 #include <memory>
 #include <mutex>
@@ -96,6 +97,132 @@ struct WSState {
     }
 };
 
+// ── WS download state ──────────────────────────────
+// Her indirme baglantisi kendi dosyasini pencereli (windowed) akisla gonderir.
+// Client her chunk'i aldiktan sonra {"ack":true} yollar; server bir sonraki
+// chunk'i gonderir. Boylece server RAM'inde en fazla DL_WINDOW chunk birikir.
+constexpr int DL_WINDOW = 4;
+
+struct DLState {
+    std::ifstream f;
+    fs::path      path;
+    std::string   name;
+    uint64_t      size  = 0;
+    uint64_t      sent  = 0;
+    size_t        chunk = 4ull * 1024 * 1024;
+    std::chrono::steady_clock::time_point t0;
+
+    void reset() {
+        if (f.is_open()) f.close();
+        path.clear();
+        name.clear();
+        size = 0;
+        sent = 0;
+    }
+};
+
+// Dosyadan bir sonraki chunk'i oku ve binary frame olarak gonder.
+// EOF'ta {"done":true} yollar ve dosyayi kapatir. Bittiyse no-op.
+void dl_send_chunk(crow::websocket::connection& conn, DLState* s) {
+    if (!s || !s->f.is_open()) return;
+
+    bool eof = (s->sent >= s->size);  // 0-byte dosya: hemen done gonder
+    if (!eof) {
+        std::string buf;
+        buf.resize(s->chunk);
+        s->f.read(buf.data(), static_cast<std::streamsize>(s->chunk));
+        auto got = static_cast<size_t>(s->f.gcount());
+        buf.resize(got);
+        if (got > 0) {
+            s->sent += got;
+            conn.send_binary(std::move(buf));
+        }
+        if (got == 0 || s->sent >= s->size) eof = true;
+    }
+
+    if (eof) {
+        auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - s->t0).count();
+        double speed = s->sent / std::max(elapsed, 0.001);
+        logf(LogLevel::Down, "{} ({}) {}/s [WS]",
+             s->name, util::human_size(s->sent),
+             util::human_size(static_cast<uint64_t>(speed)));
+        conn.send_text(R"({"done":true})");
+        s->f.close();
+    }
+}
+
+// ──────────────────────────────────────────────
+//  UDP kesif — GUI'deki "Tara" butonu bu yaniti dinler.
+//  Istek: util::DISCOVERY_MAGIC, yanit: {"lan_share":true,name,port,share}.
+// ──────────────────────────────────────────────
+
+std::thread       g_disc_thread;
+std::atomic<bool> g_disc_running{false};
+SOCKET            g_disc_sock = INVALID_SOCKET;
+
+void discovery_loop() {
+    while (g_disc_running.load()) {
+        char buf[256];
+        sockaddr_in from{};
+        int fromlen = sizeof(from);
+        int n = recvfrom(g_disc_sock, buf, sizeof(buf) - 1, 0,
+                         reinterpret_cast<sockaddr*>(&from), &fromlen);
+        if (n <= 0) continue;  // timeout veya kapatildi
+        buf[n] = '\0';
+        if (std::strncmp(buf, util::DISCOVERY_MAGIC,
+                         sizeof(util::DISCOVERY_MAGIC) - 1) != 0) continue;
+
+        char host[256] = {};
+        gethostname(host, sizeof(host));
+        std::string share = util::path_to_utf8(g_cfg.share_dir.filename());
+        if (share.empty()) share = util::path_to_utf8(g_cfg.share_dir);
+        nlohmann::json j{
+            {"lan_share", true},
+            {"name",  host},
+            {"port",  g_cfg.port},
+            {"share", share},
+        };
+        auto s = j.dump();
+        sendto(g_disc_sock, s.data(), static_cast<int>(s.size()), 0,
+               reinterpret_cast<sockaddr*>(&from), fromlen);
+    }
+}
+
+void discovery_start() {
+    if (g_disc_running.exchange(true)) return;
+    g_disc_sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_disc_sock == INVALID_SOCKET) { g_disc_running = false; return; }
+    BOOL yes = TRUE;
+    setsockopt(g_disc_sock, SOL_SOCKET, SO_REUSEADDR,
+               reinterpret_cast<const char*>(&yes), sizeof(yes));
+    DWORD tmo = 500;  // ms — kapanis bayragini periyodik kontrol icin
+    setsockopt(g_disc_sock, SOL_SOCKET, SO_RCVTIMEO,
+               reinterpret_cast<const char*>(&tmo), sizeof(tmo));
+    sockaddr_in addr{};
+    addr.sin_family      = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port        = htons(util::DISCOVERY_PORT);
+    if (bind(g_disc_sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(g_disc_sock);
+        g_disc_sock = INVALID_SOCKET;
+        g_disc_running = false;
+        logf(LogLevel::Warn, "Kesif servisi baslatilamadi (UDP {} dolu olabilir)",
+             util::DISCOVERY_PORT);
+        return;
+    }
+    g_disc_thread = std::thread(discovery_loop);
+}
+
+void discovery_stop() {
+    if (!g_disc_running.exchange(false)) return;
+    if (g_disc_sock != INVALID_SOCKET) {
+        closesocket(g_disc_sock);
+        g_disc_sock = INVALID_SOCKET;
+    }
+    if (g_disc_thread.joinable()) g_disc_thread.join();
+}
+
 // ──────────────────────────────────────────────
 //  GET handlers
 // ──────────────────────────────────────────────
@@ -156,9 +283,9 @@ crow::response serve_directory(const fs::path& path) {
         std::string name_esc  = util::html_escape(name_utf8);
 
         fs::path item_rel = fs::relative(item.path(), g_cfg.share_dir);
-        std::string url = util::path_to_utf8(item_rel);
-        for (auto& c : url) if (c == '\\') c = '/';
-        url = "/" + util::url_encode_path(url);
+        std::string rel_raw = util::path_to_utf8(item_rel);
+        for (auto& c : rel_raw) if (c == '\\') c = '/';
+        std::string url = "/" + util::url_encode_path(rel_raw);
 
         int delay = std::min(idx * 30, 600);
         std::string ds = fmt::format(" style=\"animation-delay:{}ms\"", delay);
@@ -169,13 +296,18 @@ crow::response serve_directory(const fs::path& path) {
                 "<span class=\"ico\">&#128194;</span>"
                 "<span class=\"nm\"><a class=\"dl\" href=\"{}\">{}/</a></span>"
                 "<span class=\"mt\">Klasor</span>"
-                "</li>\n", ds, url, name_esc);
+                "<button class=\"wsdl\" title=\"Klasoru indir (zip)\" "
+                "data-dir=\"1\" data-path=\"{}\" data-name=\"{}\">"
+                "&#11015;&#65039;</button>"
+                "</li>\n",
+                ds, url, name_esc, util::html_escape(rel_raw), name_esc);
         } else {
             std::string size_s = "?";
             std::string mtime_s;
+            uint64_t sz_val = 0;
             std::error_code ec2;
             auto sz = item.file_size(ec2);
-            if (!ec2) size_s = util::human_size(sz);
+            if (!ec2) { size_s = util::human_size(sz); sz_val = sz; }
             auto t  = item.last_write_time(ec2);
             if (!ec2) mtime_s = util::format_local_time(t);
             entries_html += fmt::format(
@@ -183,7 +315,12 @@ crow::response serve_directory(const fs::path& path) {
                 "<span class=\"ico\">&#128196;</span>"
                 "<span class=\"nm\"><a href=\"{}\">{}</a></span>"
                 "<span class=\"mt\">{}<br>{}</span>"
-                "</li>\n", ds, url, name_esc, size_s, mtime_s);
+                "<button class=\"wsdl\" title=\"WS ile indir\" "
+                "data-path=\"{}\" data-name=\"{}\" data-size=\"{}\">"
+                "&#11015;&#65039;</button>"
+                "</li>\n",
+                ds, url, name_esc, size_s, mtime_s,
+                util::html_escape(rel_raw), name_esc, sz_val);
         }
         ++idx;
     }
@@ -323,6 +460,21 @@ void setup_routes(crow::SimpleApp& app) {
         return r;
     });
 
+    // Kendi exe'sini indirtir — karsi PC'de uygulama yoksa tarayicidan bu
+    // linkle kurulur (bootstrap). share_dir disinda oldugu icin bilerek
+    // safe_join_under'dan gecmez; yalnizca kendi modul yolunu okur.
+    // serve_file uzerinden: Range/206 ve HEAD destegi, indirme yoneticileri
+    // (IDM vb.) ve tarayici on-kontrolleri ile uyumluluk icin gerekli.
+    CROW_ROUTE(app, "/lan_share.exe").methods("GET"_method, "HEAD"_method)
+    ([](const crow::request& req) {
+        wchar_t pathw[MAX_PATH] = {};
+        DWORD n = ::GetModuleFileNameW(nullptr, pathw, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH) {
+            crow::response r(500); r.write("exe yolu alinamadi"); return r;
+        }
+        return serve_file(fs::path(pathw), req);
+    });
+
     CROW_ROUTE(app, "/api/upload").methods("POST"_method)
     ([](const crow::request& req) {
         auto rel_path  = req.url_params.get("path");
@@ -397,6 +549,77 @@ void setup_routes(crow::SimpleApp& app) {
             }
         }
         nlohmann::json j{{"existing", existing}};
+        crow::response r{j.dump()};
+        r.add_header("Content-Type", "application/json");
+        return r;
+    });
+
+    // Bir klasorun TEK seviyesini listeler — GUI'nin uzak dosya gezgini icin.
+    CROW_ROUTE(app, "/api/browse").methods("GET"_method)
+    ([](const crow::request& req) {
+        auto dir_p = req.url_params.get("dir");
+        std::string dir = dir_p ? dir_p : "/";
+        auto base = util::safe_join_under(g_cfg.share_dir, dir);
+        std::error_code ec;
+        if (!base || !fs::is_directory(*base, ec)) {
+            crow::response r(404); r.write("Not a directory"); return r;
+        }
+        nlohmann::json entries = nlohmann::json::array();
+        for (auto it = fs::directory_iterator(
+                 *base, fs::directory_options::skip_permission_denied, ec);
+             !ec && it != fs::directory_iterator(); it.increment(ec))
+        {
+            std::error_code ec2;
+            bool isdir = it->is_directory(ec2);
+            uint64_t sz = 0;
+            if (!isdir) { sz = it->file_size(ec2); if (ec2) sz = 0; }
+            entries.push_back({
+                {"name", util::path_to_utf8(it->path().filename())},
+                {"dir",  isdir},
+                {"size", sz},
+            });
+        }
+        nlohmann::json j{{"ok", true}, {"entries", std::move(entries)}};
+        crow::response r{j.dump()};
+        r.add_header("Content-Type", "application/json");
+        return r;
+    });
+
+    // Bir klasor altindaki tum dosyalari (recursive) listeler — klasor indirme
+    // istemcisi bu listeyi alip her dosyayi /ws/download ile ceker.
+    CROW_ROUTE(app, "/api/list").methods("GET"_method)
+    ([](const crow::request& req) {
+        auto dir_p = req.url_params.get("dir");
+        std::string dir = dir_p ? dir_p : "/";
+        auto base = util::safe_join_under(g_cfg.share_dir, dir);
+        std::error_code ec;
+        if (!base || !fs::is_directory(*base, ec)) {
+            crow::response r(404); r.write("Not a directory"); return r;
+        }
+        nlohmann::json files = nlohmann::json::array();
+        uint64_t total = 0;
+        auto opts = fs::directory_options::skip_permission_denied;
+        for (auto it = fs::recursive_directory_iterator(*base, opts, ec);
+             !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+        {
+            std::error_code ec2;
+            if (!it->is_regular_file(ec2)) continue;
+            auto relp = fs::relative(it->path(), *base, ec2);
+            if (ec2) continue;
+            std::string rp = util::path_to_utf8(relp);
+            for (auto& c : rp) if (c == '\\') c = '/';
+            uint64_t sz = it->file_size(ec2);
+            if (ec2) sz = 0;
+            files.push_back({{"path", rp}, {"size", sz}});
+            total += sz;
+        }
+        nlohmann::json j{
+            {"ok",    true},
+            {"name",  util::path_to_utf8(base->filename())},
+            {"count", files.size()},
+            {"total", total},
+            {"files", std::move(files)},
+        };
         crow::response r{j.dump()};
         r.add_header("Content-Type", "application/json");
         return r;
@@ -507,6 +730,74 @@ void setup_routes(crow::SimpleApp& app) {
             delete s;
         });
 
+    CROW_WEBSOCKET_ROUTE(app, "/ws/download")
+        .onaccept([](const crow::request&, void** userdata) {
+            *userdata = new DLState{};
+            return true;
+        })
+        .onopen([](crow::websocket::connection& conn) {
+            logf(LogLevel::Ws, "dl open ({})", conn.get_remote_ip());
+        })
+        .onmessage([](crow::websocket::connection& conn,
+                      const std::string& data, bool is_binary)
+        {
+            auto* s = static_cast<DLState*>(conn.userdata());
+            if (!s || is_binary) return;  // client yalnizca text (istek/ack) yollar
+
+            auto j = nlohmann::json::parse(data, nullptr, false);
+            if (j.is_discarded()) {
+                conn.send_text(R"({"ok":false,"error":"Invalid JSON"})");
+                return;
+            }
+
+            // Yeni indirme istegi: {"path":"rel/dosya"}
+            if (j.contains("path")) {
+                s->reset();
+                std::string rel = j.value("path", std::string{});
+                auto resolved = util::safe_join_under(g_cfg.share_dir, rel);
+                std::error_code ec;
+                if (!resolved || !fs::is_regular_file(*resolved, ec)) {
+                    conn.send_text(R"({"ok":false,"error":"Dosya bulunamadi"})");
+                    return;
+                }
+                s->f.open(*resolved, std::ios::binary);
+                if (!s->f.is_open()) {
+                    conn.send_text(R"({"ok":false,"error":"Dosya acilamadi"})");
+                    return;
+                }
+                s->path  = *resolved;
+                s->name  = util::path_to_utf8(resolved->filename());
+                s->size  = fs::file_size(*resolved, ec);
+                s->chunk = static_cast<size_t>(std::max(1, g_cfg.buffer_mb))
+                           * 1024 * 1024;
+                s->sent  = 0;
+                s->t0    = std::chrono::steady_clock::now();
+
+                nlohmann::json meta{
+                    {"ok",   true},
+                    {"name", s->name},
+                    {"size", s->size},
+                };
+                conn.send_text(meta.dump());
+
+                // Pencereyi doldur: ilk DL_WINDOW chunk'i pesin gonder.
+                for (int i = 0; i < DL_WINDOW; ++i) dl_send_chunk(conn, s);
+                return;
+            }
+
+            // Client bir chunk'i onayladi: siradakini gonder.
+            if (j.value("ack", false)) dl_send_chunk(conn, s);
+        })
+        .onclose([](crow::websocket::connection& conn,
+                    const std::string&, uint16_t)
+        {
+            auto* s = static_cast<DLState*>(conn.userdata());
+            if (!s) return;
+            if (s->f.is_open()) s->f.close();
+            logf(LogLevel::Ws, "dl close ({})", conn.get_remote_ip());
+            delete s;
+        });
+
     CROW_CATCHALL_ROUTE(app)
     ([](const crow::request& req) {
         const std::string& p = req.url;
@@ -547,6 +838,7 @@ bool start(const Config& cfg) {
          .port(static_cast<uint16_t>(cfg.port))
          .concurrency(threads);
 
+    discovery_start();
     g_thread = std::thread([] {
         try {
             g_app->multithreaded().run();
@@ -564,6 +856,7 @@ void stop() {
     if (g_thread.joinable()) g_thread.join();
     g_app.reset();
     g_running = false;
+    discovery_stop();
 }
 
 void run_blocking(const Config& cfg) {
@@ -572,12 +865,14 @@ void run_blocking(const Config& cfg) {
     app.loglevel(crow::LogLevel::Warning);
     app.stream_threshold(512ull * 1024 * 1024);  // 512 MiB
     setup_routes(app);
+    discovery_start();
     auto threads = std::max(2u, std::thread::hardware_concurrency());
     app.bindaddr("0.0.0.0")
        .port(static_cast<uint16_t>(cfg.port))
        .concurrency(threads)
        .multithreaded()
        .run();
+    discovery_stop();
 }
 
 } // namespace server

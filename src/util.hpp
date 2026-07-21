@@ -22,6 +22,11 @@ namespace util {
 
 namespace fs = std::filesystem;
 
+// ── LAN kesif sabitleri ──
+// server.cpp UDP responder'i ve client.cpp taramasi ayni degerleri kullanir.
+inline constexpr uint16_t DISCOVERY_PORT    = 48950;
+inline constexpr char     DISCOVERY_MAGIC[] = "LANSHARE_DISCOVER";
+
 // UTF-8 <-> fs::path
 inline fs::path utf8_to_path(std::string_view s) {
     return fs::path(std::u8string(

@@ -8,7 +8,20 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 if(MSVC)
     add_compile_options(/W4 /utf-8 /Zc:__cplusplus /permissive-)
     add_compile_definitions(_WIN32_WINNT=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN)
+
+    # Compile .rc directly instead of through CMake's cmcldeps dependency
+    # wrapper. On non-English MSVC locales the wrapper injects the localized
+    # "show includes" prefix (e.g. "Not: eklenen dosya:") into the rc.exe
+    # command line, which fails with RC1107. Dropping depfile tracking for
+    # resources is harmless — app.rc rarely changes.
+    set(CMAKE_NINJA_CMCLDEPS_RC OFF)
+    set(CMAKE_RC_COMPILE_OBJECT
+        "<CMAKE_RC_COMPILER> <DEFINES> <INCLUDES> <FLAGS> /fo <OBJECT> <SOURCE>")
 endif()
+
+# Statik link — vcpkg'in kopyalanacak DLL aramasina gerek yok. Bu adim ayrica
+# pwsh.exe cagirdigi icin bazi ortamlarda link'i gereksiz yere bozuyor.
+set(VCPKG_APPLOCAL_DEPS OFF)
 
 find_package(Crow CONFIG REQUIRED)
 find_package(nlohmann_json CONFIG REQUIRED)
@@ -20,6 +33,7 @@ add_executable(lan_share
     src/main.cpp
     src/server.cpp
     src/gui_app.cpp
+    src/client.cpp
 )
 
 if(WIN32)

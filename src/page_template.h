@@ -54,8 +54,13 @@ inline constexpr std::string_view PAGE_TEMPLATE = R"HTML(<!DOCTYPE html>
   h1 {{ font-size:1.35rem; font-weight:700; letter-spacing:-0.02em;
     background:linear-gradient(135deg,#f1f5f9,#94a3b8);
     -webkit-background-clip:text; -webkit-text-fill-color:transparent; background-clip:text; }}
-  .path {{ font-size:.78rem; color:var(--text3); margin-bottom:24px;
+  .path {{ font-size:.78rem; color:var(--text3); margin-bottom:6px;
     font-family:'Cascadia Code','Fira Code',monospace; word-break:break-all; padding-left:58px; }}
+  .apphint {{ font-size:.75rem; color:var(--text3); padding-left:58px; margin-bottom:24px; }}
+  .apphint a {{ color:#7dd3fc; text-decoration:none; }}
+  .apphint a:hover {{ color:#38bdf8; }}
+  .ft a {{ color:#7dd3fc; text-decoration:none; }}
+  .ft a:hover {{ color:#38bdf8; }}
 
   .ubox {{ border:2px dashed var(--border); border-radius:16px; padding:28px 20px;
     text-align:center; transition:all .3s cubic-bezier(.4,0,.2,1);
@@ -131,6 +136,12 @@ inline constexpr std::string_view PAGE_TEMPLATE = R"HTML(<!DOCTYPE html>
   .nm .dl {{ color:#7dd3fc; }} .nm .dl:hover {{ color:#38bdf8; }}
   .mt {{ font-size:.73rem; color:var(--text3); flex-shrink:0; text-align:right;
     font-family:'Cascadia Code','Fira Code',monospace; line-height:1.5; }}
+  .wsdl {{ flex-shrink:0; background:var(--card); border:1px solid var(--border);
+    color:#7dd3fc; border-radius:8px; padding:6px 11px; cursor:pointer;
+    font-size:.95rem; line-height:1; transition:all .15s; }}
+  .wsdl:hover {{ border-color:var(--accent); color:#38bdf8;
+    background:var(--hover); box-shadow:0 0 12px var(--glow); }}
+  .q-fill.downloading {{ background:linear-gradient(90deg,#0ea5e9,#22c55e); }}
   .empty {{ color:var(--text3); text-align:center; padding:48px 20px; font-size:.9rem; }}
   .empty-ico {{ font-size:2.5rem; margin-bottom:12px; display:block; opacity:.5; }}
 
@@ -148,6 +159,9 @@ inline constexpr std::string_view PAGE_TEMPLATE = R"HTML(<!DOCTYPE html>
     <h1>{title}</h1>
   </div>
   <div class="path">{rel_path}</div>
+  <div class="apphint">&#128161; Klas&ouml;rleri tam h&iacute;zda, yap&iacute;s&iacute;yla indirmek i&ccedil;in:
+    <a href="/lan_share.exe">uygulamay&iacute; indir</a>
+    &middot; a&ccedil; &rarr; "Al (Indir)" sekmesi &rarr; Tara &rarr; bu cihaza ba&#287;lan</div>
 
   <div id="dashboard">
     <div id="overall">
@@ -183,7 +197,8 @@ inline constexpr std::string_view PAGE_TEMPLATE = R"HTML(<!DOCTYPE html>
   <ul class="fl">
 {entries}
   </ul>
-  <div class="ft">LAN Dosya Paylasimi &mdash; {server_info}</div>
+  <div class="ft">LAN Dosya Paylasimi &mdash; {server_info} &mdash;
+    <a href="/lan_share.exe">&#128190; Uygulamay&iacute; &Iacute;ndir</a></div>
 </div>
 
 <script>
@@ -499,6 +514,239 @@ fi.addEventListener("change", () => {{
 fiDir.addEventListener("change", () => {{
   if (!fiDir.files.length) return;
   processFilesChunked(Array.from(fiDir.files), f => f.webkitRelativePath || f.name);
+}});
+
+// ── WS indirme ────────────────────────────────────────────────────────
+// /ws/download uzerinden pencereli (windowed) chunk akisi. Guvenli baglamda
+// (localhost/https) File System Access API ile diske stream edilir; aksi
+// halde (LAN IP + http) Blob'a toplanir. Klasorler istemci tarafinda ZIP
+// (store, sifir sikistirma) olarak paketlenir — harici kutuphane yok.
+
+// Tek dosyayi WS ile ceker. onChunk(u8, received, size) her parca icin
+// cagrilir ve await edilir (backpressure). done olunca resolve.
+function wsStream(serverPath, onChunk) {{
+  return new Promise((resolve, reject) => {{
+    const ws = new WebSocket(`ws://${{location.host}}/ws/download`);
+    ws.binaryType = 'arraybuffer';
+    let size = 0, received = 0, chain = Promise.resolve(), done = false;
+    ws.onopen  = () => ws.send(JSON.stringify({{ path: serverPath }}));
+    ws.onerror = () => {{ if (!done) {{ done = true; reject(new Error('Baglanti hatasi')); }} }};
+    ws.onclose = () => {{ if (!done) {{ done = true; reject(new Error('Baglanti koptu')); }} }};
+    ws.onmessage = (e) => {{
+      if (typeof e.data === 'string') {{
+        const m = JSON.parse(e.data);
+        if (m.ok === false) {{ done = true; try {{ ws.close(); }} catch (_) {{}} reject(new Error(m.error || 'Hata')); return; }}
+        if (m.ok === true)  {{ size = m.size; return; }}
+        if (m.done) {{
+          chain.then(() => {{ done = true; try {{ ws.close(); }} catch (_) {{}} resolve({{ size, received }}); }})
+               .catch((err) => {{ done = true; reject(err); }});
+        }}
+        return;
+      }}
+      const u8 = new Uint8Array(e.data);
+      chain = chain.then(async () => {{
+        await onChunk(u8, received, size);
+        received += u8.byteLength;
+        ws.send(JSON.stringify({{ ack: true }}));
+      }});
+    }};
+  }});
+}}
+
+// ── Ilerleme satiri (dosya adlari textContent ile — XSS yok) ──
+function dlRow(labelText) {{
+  dashboard.classList.add('active');
+  const el = document.createElement('div'); el.className = 'q-item';
+  const top = document.createElement('div'); top.className = 'q-top';
+  const nm = document.createElement('span'); nm.className = 'q-name'; nm.textContent = labelText;
+  const info = document.createElement('span'); info.className = 'q-info'; info.textContent = 'Baglaniyor...';
+  top.appendChild(nm); top.appendChild(info);
+  const wrap = document.createElement('div'); wrap.className = 'q-bar';
+  const bar = document.createElement('div'); bar.className = 'q-fill downloading'; wrap.appendChild(bar);
+  el.appendChild(top); el.appendChild(wrap);
+  queue.appendChild(el);
+  return {{ el, nm, bar, info, t0: Date.now() }};
+}}
+function dlRowDone(row, text) {{
+  row.bar.style.width = '100%'; row.bar.className = 'q-fill done';
+  row.info.textContent = text || 'Bitti';
+  setTimeout(() => row.el.remove(), 2000);
+}}
+function dlRowFail(row, msg) {{
+  row.bar.style.width = '100%'; row.bar.className = 'q-fill error';
+  row.info.textContent = msg || 'Hata';
+}}
+function downloadBlob(blob, name) {{
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob); a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 15000);
+}}
+function joinPath(a, b) {{ return a.replace(/\/+$/, '') + '/' + b; }}
+
+// ── Tek dosya indirme ──
+async function wsDownloadFile(btn) {{
+  const relPath = btn.dataset.path, name = btn.dataset.name;
+  let writable = null, parts = null;
+  if (window.showSaveFilePicker) {{
+    try {{
+      const h = await window.showSaveFilePicker({{ suggestedName: name }});
+      writable = await h.createWritable();
+    }} catch (e) {{
+      if (e && e.name === 'AbortError') return;
+      writable = null;  // guvensiz baglam / reddedildi → Blob'a dus
+    }}
+  }}
+  if (!writable) parts = [];
+
+  const row = dlRow('⬇️ ' + name);
+  try {{
+    await wsStream(relPath, async (u8, received, size) => {{
+      if (writable) await writable.write(u8); else parts.push(u8);
+      const cur = received + u8.byteLength;
+      const pct = size > 0 ? Math.min(100, cur / size * 100) : 0;
+      row.bar.style.width = pct.toFixed(1) + '%';
+      const sp = cur / Math.max((Date.now() - row.t0) / 1000, 0.001);
+      row.info.textContent = `${{pct.toFixed(0)}}% (${{fmtB(sp)}}/s)`;
+    }});
+    if (writable) await writable.close();
+    else downloadBlob(new Blob(parts), name);
+    dlRowDone(row);
+  }} catch (e) {{
+    dlRowFail(row, e.message);
+    try {{ if (writable) await writable.abort(); }} catch (_) {{}}
+  }}
+}}
+
+// ── Klasor indirme ──
+async function wsDownloadFolder(btn) {{
+  const relDir = btn.dataset.path, name = btn.dataset.name;
+
+  // Guvenli baglamda diske klasor yapisiyla yaz; degilse ZIP olustur.
+  let dirHandle = null;
+  if (window.showDirectoryPicker) {{
+    try {{ dirHandle = await window.showDirectoryPicker({{ mode: 'readwrite' }}); }}
+    catch (e) {{ if (e && e.name === 'AbortError') return; dirHandle = null; }}
+  }}
+
+  let data;
+  try {{
+    const res = await fetch('/api/list?dir=' + encodeURIComponent(relDir));
+    data = await res.json();
+  }} catch (e) {{ alert('Klasor listesi alinamadi: ' + e.message); return; }}
+  if (!data || !data.ok) {{ alert('Klasor listesi alinamadi'); return; }}
+  if (data.count === 0) {{ alert('Klasor bos'); return; }}
+  if (!dirHandle && (data.total || 0) > 0xFFFFFFFF) {{
+    alert('Klasor 4GB\\'tan buyuk — ZIP olusturulamiyor. Dosyalari tek tek indirin.');
+    return;
+  }}
+
+  const row = dlRow('📁 ' + name + '  (0/' + data.count + ')');
+  const totalSize = data.total || 0;
+  let filesDone = 0, grandRecv = 0;
+  const progress = (extra) => {{
+    const cur = grandRecv + extra;
+    const pct = totalSize > 0 ? Math.min(100, cur / totalSize * 100) : 0;
+    row.bar.style.width = pct.toFixed(1) + '%';
+    const sp = cur / Math.max((Date.now() - row.t0) / 1000, 0.001);
+    row.info.textContent = `${{filesDone}}/${{data.count}} dosya | ${{fmtB(cur)}} (${{fmtB(sp)}}/s)`;
+  }};
+
+  try {{
+    if (dirHandle) {{
+      const destRoot = await dirHandle.getDirectoryHandle(name, {{ create: true }});
+      for (const f of data.files) {{
+        const segs = f.path.split('/'); const fn = segs.pop();
+        let dir = destRoot;
+        for (const p of segs) dir = await dir.getDirectoryHandle(p, {{ create: true }});
+        const fh = await dir.getFileHandle(fn, {{ create: true }});
+        const w = await fh.createWritable();
+        try {{
+          await wsStream(joinPath(relDir, f.path), async (u8, rec) => {{ await w.write(u8); progress(rec + u8.byteLength); }});
+          await w.close();
+        }} catch (e) {{ try {{ await w.abort(); }} catch (_) {{}} throw e; }}
+        grandRecv += f.size; filesDone++;
+        row.nm.textContent = '📁 ' + name + '  (' + filesDone + '/' + data.count + ')';
+      }}
+    }} else {{
+      const zip = new ZipStore();
+      for (const f of data.files) {{
+        const chunks = [];
+        await wsStream(joinPath(relDir, f.path), async (u8, rec) => {{ chunks.push(u8); progress(rec + u8.byteLength); }});
+        zip.add(f.path, chunks);
+        grandRecv += f.size; filesDone++;
+        row.nm.textContent = '📁 ' + name + '  (' + filesDone + '/' + data.count + ')';
+      }}
+      downloadBlob(zip.finish(), name + '.zip');
+    }}
+    dlRowDone(row, `Bitti — ${{filesDone}}/${{data.count}} dosya (${{fmtB(grandRecv)}})`);
+  }} catch (e) {{
+    dlRowFail(row, e.message);
+  }}
+}}
+
+// ── ZIP (store / sifir sikistirma) — harici kutuphane yok ──
+const CRC_TABLE = (() => {{
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {{
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }}
+  return t;
+}})();
+function crc32(chunks) {{
+  let c = 0xFFFFFFFF;
+  for (const u8 of chunks) for (let i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}}
+class ZipStore {{
+  constructor() {{ this.parts = []; this.central = []; this.offset = 0; this.count = 0; this.enc = new TextEncoder(); }}
+  add(name, chunks) {{
+    const nameBytes = this.enc.encode(name);
+    let size = 0; for (const c of chunks) size += c.length;
+    const crc = crc32(chunks);
+    const lh = new DataView(new ArrayBuffer(30));
+    lh.setUint32(0, 0x04034b50, true);
+    lh.setUint16(4, 20, true); lh.setUint16(6, 0x0800, true); lh.setUint16(8, 0, true);
+    lh.setUint16(10, 0, true); lh.setUint16(12, 0x21, true);
+    lh.setUint32(14, crc, true); lh.setUint32(18, size, true); lh.setUint32(22, size, true);
+    lh.setUint16(26, nameBytes.length, true); lh.setUint16(28, 0, true);
+    const off = this.offset;
+    this._push(new Uint8Array(lh.buffer)); this._push(nameBytes);
+    for (const c of chunks) this._push(c);
+    const ch = new DataView(new ArrayBuffer(46));
+    ch.setUint32(0, 0x02014b50, true);
+    ch.setUint16(4, 20, true); ch.setUint16(6, 20, true); ch.setUint16(8, 0x0800, true); ch.setUint16(10, 0, true);
+    ch.setUint16(12, 0, true); ch.setUint16(14, 0x21, true);
+    ch.setUint32(16, crc, true); ch.setUint32(20, size, true); ch.setUint32(24, size, true);
+    ch.setUint16(28, nameBytes.length, true); ch.setUint16(30, 0, true); ch.setUint16(32, 0, true);
+    ch.setUint16(34, 0, true); ch.setUint16(36, 0, true); ch.setUint32(38, 0, true);
+    ch.setUint32(42, off, true);
+    this.central.push(new Uint8Array(ch.buffer)); this.central.push(nameBytes);
+    this.count++;
+  }}
+  _push(u8) {{ this.parts.push(u8); this.offset += u8.length; }}
+  finish() {{
+    const centralStart = this.offset;
+    let centralSize = 0;
+    for (const p of this.central) {{ this.parts.push(p); centralSize += p.length; this.offset += p.length; }}
+    const eocd = new DataView(new ArrayBuffer(22));
+    eocd.setUint32(0, 0x06054b50, true);
+    eocd.setUint16(4, 0, true); eocd.setUint16(6, 0, true);
+    eocd.setUint16(8, this.count, true); eocd.setUint16(10, this.count, true);
+    eocd.setUint32(12, centralSize, true); eocd.setUint32(16, centralStart, true);
+    eocd.setUint16(20, 0, true);
+    this.parts.push(new Uint8Array(eocd.buffer));
+    return new Blob(this.parts, {{ type: 'application/zip' }});
+  }}
+}}
+
+document.querySelector('.fl').addEventListener('click', (e) => {{
+  const b = e.target.closest('.wsdl');
+  if (!b) return;
+  e.preventDefault(); e.stopPropagation();
+  if (b.dataset.dir === '1') wsDownloadFolder(b); else wsDownloadFile(b);
 }});
 </script>
 </body>
